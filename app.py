@@ -13,12 +13,30 @@ except ImportError:
     HAS_GEOPANDAS = False
 
 # ---------------------------------------------------------
-# 1. 페이지 설정
+# 1. 페이지 설정 및 캡처 최적화 여백 조정
 # ---------------------------------------------------------
 st.set_page_config(
     page_title="낮 평균온도 기반 GIS 핫스팟 선정",
     page_icon="🌡️",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="collapsed"  # 캡처 시 넓은 화면 확보를 위해 기본 접힘 상태
+)
+
+st.markdown(
+    """
+    <style>
+        .block-container {
+            padding-top: 1.5rem;
+            padding-bottom: 1rem;
+            padding-left: 2rem;
+            padding-right: 2rem;
+        }
+        div[data-testid="stMetricValue"] {
+            font-size: 1.6rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True
 )
 
 st.title("🌡️ 낮 평균온도 기반 GIS 핫스팟 선정 대시보드")
@@ -116,14 +134,12 @@ if df.empty:
     st.error("유효한 좌표 및 온도 데이터가 없습니다. 사이드바의 컬럼 매핑을 확인해 주세요.")
     st.stop()
 
-# 위도·경도 반전 자동 보정 (한국 기준 위도 ~36, 경도 ~127)
 if (df["lat"].abs() > 90).any() and (df["lon"].abs() <= 90).all():
     st.warning("⚠️ 위도(lat)와 경도(lon)가 반대로 입력되어 자동으로 교정했습니다.")
     df["lat"], df["lon"] = df["lon"].copy(), df["lat"].copy()
 
-# 투영좌표계(TM 등) 감지
 if (df["lat"].abs() > 90).any() or (df["lon"].abs() > 180).any():
-    st.error("⚠️ 위경도(WGS84, EPSG:4326)가 아닌 평면직각좌표(TM 등)가 감지되었습니다. QGIS에서 EPSG:4326으로 내보내거나 GeoJSON/Shapefile(.zip)로 업로드해 주세요.")
+    st.error("⚠️ 위경도(WGS84, EPSG:4326)가 아닌 평면직각좌표(TM 등)가 감지되었습니다. EPSG:4326으로 변환 후 업로드해 주세요.")
     st.stop()
 
 df["순위"] = df.index + 1
@@ -148,6 +164,7 @@ with st.sidebar:
         "지도 배경 스타일",
         ["OpenStreetMap (도로·건물 명확)", "위성지도 (아스팔트·현장 확인용)", "CartoDB positron (심플 밝은 테마)"]
     )
+    show_map_labels = st.checkbox("지도에 선정 핫스팟 이름·온도 표시", value=True)
 
 hotspots = df[df["핫스팟_선정"]]
 
@@ -164,9 +181,10 @@ c4.metric("선정된 핫스팟 수", f"{len(hotspots)} 개 / 총 {len(df)} 개")
 st.divider()
 
 # ---------------------------------------------------------
-# 7. GIS 지도 및 순위 차트 시각화
+# 7. 대형 GIS 지도 및 순위 차트 시각화 (캡처 메인 영역)
 # ---------------------------------------------------------
-col_map, col_chart = st.columns([1.2, 1])
+VIS_HEIGHT = 650
+col_map, col_chart = st.columns([1.35, 1])
 
 with col_map:
     st.subheader("🗺️ 낮 평균온도 분포 및 선정 핫스팟 지도")
@@ -185,17 +203,17 @@ with col_map:
     else:
         m = folium.Map(location=[center_lat, center_lon], zoom_start=15, tiles="OpenStreetMap")
 
-    # 온도 차이를 극대화하기 위한 정규화 히트맵 레이어 (배경 지도가 비치도록 투명도 조절)
+    # 정규화 히트맵 레이어
     t_min, t_max = df["day_avg_temp"].min(), df["day_avg_temp"].max()
     df["heat_weight"] = (df["day_avg_temp"] - t_min) / (t_max - t_min + 1e-6) + 0.2
     heat_data = df[["lat", "lon", "heat_weight"]].values.tolist()
-    HeatMap(heat_data, radius=30, blur=20, min_opacity=0.35, max_zoom=16).add_to(m)
+    HeatMap(heat_data, radius=34, blur=22, min_opacity=0.35, max_zoom=16).add_to(m)
 
-    # 지점별 마커 표시
+    # 지점별 마커 및 캡처용 텍스트 라벨
     for _, row in df.iterrows():
         is_selected = row["핫스팟_선정"]
         color = "#FF1E1E" if row["순위"] == 1 else ("#FF8C00" if is_selected else "#2563EB")
-        radius = 12 if row["순위"] == 1 else (9 if is_selected else 6)
+        radius = 13 if row["순위"] == 1 else (10 if is_selected else 7)
 
         popup_html = f"""
         <div style="font-family: sans-serif; min-width: 160px;">
@@ -209,22 +227,70 @@ with col_map:
             location=[row["lat"], row["lon"]],
             radius=radius,
             color="#FFFFFF",
-            weight=1.5,
+            weight=2,
             fill=True,
             fill_color=color,
-            fill_opacity=0.9,
+            fill_opacity=0.92,
             popup=folium.Popup(popup_html, max_width=250),
             tooltip=f"{row['순위']}위: {row['지점명']} ({row['day_avg_temp']:.1f}°C)"
         ).add_to(m)
 
-    # 데이터 전체가 한 화면에 들어오도록 자동 줌 조정
+        # 정지 화면 캡처 시에도 식별 가능하도록 선정 핫스팟 상시 라벨 표시
+        if show_map_labels and is_selected:
+            border_color = "#FF1E1E" if row["순위"] == 1 else "#FF8C00"
+            folium.Marker(
+                location=[row["lat"], row["lon"]],
+                icon=folium.DivIcon(
+                    html=f"""
+                    <div style="
+                        font-family: 'Malgun Gothic', sans-serif;
+                        font-size: 12px;
+                        font-weight: 700;
+                        color: #111827;
+                        background: rgba(255, 255, 255, 0.92);
+                        border: 2px solid {border_color};
+                        border-radius: 6px;
+                        padding: 2px 7px;
+                        white-space: nowrap;
+                        box-shadow: 0 2px 4px rgba(0,0,0,0.25);
+                        transform: translate(12px, -12px);
+                    ">
+                        {row['순위']}위 {row['지점명']} ({row['day_avg_temp']:.1f}°C)
+                    </div>
+                    """
+                )
+            ).add_to(m)
+
+    # 캡처용 우측 하단 범례 오버레이
+    legend_html = """
+    <div style="
+        position: fixed;
+        bottom: 22px;
+        left: 22px;
+        z-index: 9999;
+        background: rgba(255, 255, 255, 0.93);
+        padding: 10px 14px;
+        border-radius: 8px;
+        border: 1px solid #CBD5E1;
+        font-family: 'Malgun Gothic', sans-serif;
+        font-size: 12px;
+        color: #1E293B;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+    ">
+        <div style="font-weight: 700; margin-bottom: 6px;">핫스팟 구분</div>
+        <div style="margin-bottom: 4px;"><span style="display:inline-block;width:11px;height:11px;border-radius:50%;background:#FF1E1E;margin-right:6px;"></span>1순위 최우선 핫스팟</div>
+        <div style="margin-bottom: 4px;"><span style="display:inline-block;width:11px;height:11px;border-radius:50%;background:#FF8C00;margin-right:6px;"></span>선정 핫스팟</div>
+        <div><span style="display:inline-block;width:11px;height:11px;border-radius:50%;background:#2563EB;margin-right:6px;"></span>일반 지점</div>
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+
     sw = [df["lat"].min(), df["lon"].min()]
     ne = [df["lat"].max(), df["lon"].max()]
     if sw != ne:
-        m.fit_bounds([sw, ne], padding=(35, 35))
+        m.fit_bounds([sw, ne], padding=(45, 45))
 
-    # st_folium 흰 화면 버그 방지를 위한 HTML 직접 렌더링
-    components.html(m._repr_html_(), height=500)
+    components.html(m._repr_html_(), height=VIS_HEIGHT)
 
 with col_chart:
     st.subheader("📊 지점별 낮 평균온도 순위 비교")
@@ -249,28 +315,25 @@ with col_chart:
     )
     fig.update_traces(texttemplate="%{text:.1f}°C", textposition="outside")
     fig.update_layout(
-        height=500,
-        margin=dict(l=10, r=40, t=30, b=20),
+        height=VIS_HEIGHT,
+        margin=dict(l=10, r=45, t=35, b=20),
         xaxis_range=[max(0, t_min - 3), t_max + 2.5],
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        font=dict(size=13)
     )
     st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------
-# 8. 순위표 및 결과 내보내기
+# 8. 결과 CSV 내보내기 (메인 캡처 영역 방해 방지를 위해 사이드바 배치)
 # ---------------------------------------------------------
-st.subheader("📋 낮 평균온도 기반 우선순위 평가표")
-display_cols = ["순위", "지점명", "day_avg_temp", "평균대비_편차(°C)", "lat", "lon", "핫스팟_선정"]
-st.dataframe(
-    df[display_cols].rename(columns={"day_avg_temp": "낮_평균온도(°C)"}),
-    use_container_width=True,
-    hide_index=True
-)
-
-csv_bytes = df[display_cols].to_csv(index=False).encode("utf-8-sig")
-st.download_button(
-    label="📥 핫스팟 선정 결과 CSV 다운로드",
-    data=csv_bytes,
-    file_name="hotspot_daytime_temp_ranking.csv",
-    mime="text/csv"
-)
+with st.sidebar:
+    st.divider()
+    export_cols = ["순위", "지점명", "day_avg_temp", "평균대비_편차(°C)", "lat", "lon", "핫스팟_선정"]
+    csv_bytes = df[export_cols].to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="📥 핫스팟 선정 결과 CSV 다운로드",
+        data=csv_bytes,
+        file_name="hotspot_daytime_temp_ranking.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
