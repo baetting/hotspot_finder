@@ -1,12 +1,11 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import folium
 from folium.plugins import HeatMap
-from streamlit_folium import st_folium
 import plotly.express as px
 
-# GeoJSON / Shapefile 지원을 위한 선택적 임포트
 try:
     import geopandas as gpd
     HAS_GEOPANDAS = True
@@ -26,7 +25,7 @@ st.title("🌡️ 낮 평균온도 기반 GIS 핫스팟 선정 대시보드")
 st.caption("복합 환경 변수 없이 낮 평균온도(°C) 단일 기준만으로 열환경 우선 개선 대상지를 도출합니다.")
 
 # ---------------------------------------------------------
-# 2. 샘플 데이터 생성 (파일 미업로드 시 기본 동작)
+# 2. 샘플 데이터 생성
 # ---------------------------------------------------------
 def load_sample_data() -> pd.DataFrame:
     data = [
@@ -89,7 +88,6 @@ with st.sidebar:
 
     cols = raw_df.columns.tolist()
 
-    # 컬럼 자동 매핑 (업로드 파일의 컬럼명이 다를 경우 직접 선택 가능)
     default_name = cols.index("지점명") if "지점명" in cols else 0
     default_lat = cols.index("lat") if "lat" in cols else 0
     default_lon = cols.index("lon") if "lon" in cols else 0
@@ -97,15 +95,15 @@ with st.sidebar:
 
     st.subheader("📌 컬럼 매핑")
     name_col = st.selectbox("지점명 컬럼", cols, index=default_name)
-    lat_col = st.selectbox("위도(Latitude) 컬럼", cols, index=default_lat)
-    lon_col = st.selectbox("경도(Longitude) 컬럼", cols, index=default_lon)
+    lat_col = st.selectbox("위도(Latitude, ~36) 컬럼", cols, index=default_lat)
+    lon_col = st.selectbox("경도(Longitude, ~127) 컬럼", cols, index=default_lon)
     temp_col = st.selectbox("낮 평균온도(°C) 컬럼", cols, index=default_temp)
 
     st.subheader("🎯 핫스팟 선정 기준")
     filter_mode = st.radio("추출 방식", ["상위 N개 선정", "기준 온도(°C) 이상"])
 
 # ---------------------------------------------------------
-# 5. 데이터 정제 및 단일 기준 순위 산정
+# 5. 데이터 정제 및 좌표 검증
 # ---------------------------------------------------------
 df = raw_df[[name_col, lat_col, lon_col, temp_col]].copy()
 df.columns = ["지점명", "lat", "lon", "day_avg_temp"]
@@ -113,6 +111,20 @@ df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
 df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
 df["day_avg_temp"] = pd.to_numeric(df["day_avg_temp"], errors="coerce")
 df = df.dropna().sort_values(by="day_avg_temp", ascending=False).reset_index(drop=True)
+
+if df.empty:
+    st.error("유효한 좌표 및 온도 데이터가 없습니다. 사이드바의 컬럼 매핑을 확인해 주세요.")
+    st.stop()
+
+# 위도·경도 반전 자동 보정 (한국 기준 위도 ~36, 경도 ~127)
+if (df["lat"].abs() > 90).any() and (df["lon"].abs() <= 90).all():
+    st.warning("⚠️ 위도(lat)와 경도(lon)가 반대로 입력되어 자동으로 교정했습니다.")
+    df["lat"], df["lon"] = df["lon"].copy(), df["lat"].copy()
+
+# 투영좌표계(TM 등) 감지
+if (df["lat"].abs() > 90).any() or (df["lon"].abs() > 180).any():
+    st.error("⚠️ 위경도(WGS84, EPSG:4326)가 아닌 평면직각좌표(TM 등)가 감지되었습니다. QGIS에서 EPSG:4326으로 내보내거나 GeoJSON/Shapefile(.zip)로 업로드해 주세요.")
+    st.stop()
 
 df["순위"] = df.index + 1
 mean_temp = df["day_avg_temp"].mean()
@@ -132,7 +144,10 @@ with st.sidebar:
         )
         df["핫스팟_선정"] = df["day_avg_temp"] >= threshold
 
-    map_theme = st.selectbox("지도 배경 스타일", ["CartoDB positron (밝은 테마)", "CartoDB dark_matter (고대비 어두운 테마)"])
+    map_theme = st.selectbox(
+        "지도 배경 스타일",
+        ["OpenStreetMap (도로·건물 명확)", "위성지도 (아스팔트·현장 확인용)", "CartoDB positron (심플 밝은 테마)"]
+    )
 
 hotspots = df[df["핫스팟_선정"]]
 
@@ -155,24 +170,31 @@ col_map, col_chart = st.columns([1.2, 1])
 
 with col_map:
     st.subheader("🗺️ 낮 평균온도 분포 및 선정 핫스팟 지도")
-    tile_name = "CartoDB positron" if "positron" in map_theme else "CartoDB dark_matter"
 
-    m = folium.Map(
-        location=[df["lat"].mean(), df["lon"].mean()],
-        zoom_start=15,
-        tiles=tile_name
-    )
+    center_lat, center_lon = df["lat"].mean(), df["lon"].mean()
 
-    # 온도 차이를 극대화하기 위한 정규화 히트맵 레이어
+    if "위성지도" in map_theme:
+        m = folium.Map(
+            location=[center_lat, center_lon],
+            zoom_start=15,
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Esri World Imagery"
+        )
+    elif "positron" in map_theme:
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=15, tiles="CartoDB positron")
+    else:
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=15, tiles="OpenStreetMap")
+
+    # 온도 차이를 극대화하기 위한 정규화 히트맵 레이어 (배경 지도가 비치도록 투명도 조절)
     t_min, t_max = df["day_avg_temp"].min(), df["day_avg_temp"].max()
     df["heat_weight"] = (df["day_avg_temp"] - t_min) / (t_max - t_min + 1e-6) + 0.2
     heat_data = df[["lat", "lon", "heat_weight"]].values.tolist()
-    HeatMap(heat_data, radius=32, blur=22, max_zoom=16).add_to(m)
+    HeatMap(heat_data, radius=30, blur=20, min_opacity=0.35, max_zoom=16).add_to(m)
 
     # 지점별 마커 표시
     for _, row in df.iterrows():
         is_selected = row["핫스팟_선정"]
-        color = "#FF2B2B" if row["순위"] == 1 else ("#FF8C00" if is_selected else "#4A90E2")
+        color = "#FF1E1E" if row["순위"] == 1 else ("#FF8C00" if is_selected else "#2563EB")
         radius = 12 if row["순위"] == 1 else (9 if is_selected else 6)
 
         popup_html = f"""
@@ -186,15 +208,23 @@ with col_map:
         folium.CircleMarker(
             location=[row["lat"], row["lon"]],
             radius=radius,
-            color=color,
+            color="#FFFFFF",
+            weight=1.5,
             fill=True,
             fill_color=color,
-            fill_opacity=0.85,
+            fill_opacity=0.9,
             popup=folium.Popup(popup_html, max_width=250),
             tooltip=f"{row['순위']}위: {row['지점명']} ({row['day_avg_temp']:.1f}°C)"
         ).add_to(m)
 
-    st_folium(m, width=None, height=480, use_container_width=True)
+    # 데이터 전체가 한 화면에 들어오도록 자동 줌 조정
+    sw = [df["lat"].min(), df["lon"].min()]
+    ne = [df["lat"].max(), df["lon"].max()]
+    if sw != ne:
+        m.fit_bounds([sw, ne], padding=(35, 35))
+
+    # st_folium 흰 화면 버그 방지를 위한 HTML 직접 렌더링
+    components.html(m._repr_html_(), height=500)
 
 with col_chart:
     st.subheader("📊 지점별 낮 평균온도 순위 비교")
@@ -219,7 +249,7 @@ with col_chart:
     )
     fig.update_traces(texttemplate="%{text:.1f}°C", textposition="outside")
     fig.update_layout(
-        height=480,
+        height=500,
         margin=dict(l=10, r=40, t=30, b=20),
         xaxis_range=[max(0, t_min - 3), t_max + 2.5],
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
